@@ -259,12 +259,28 @@ void isogeny_constant(uint8_t number,
         else            sel_dummy[i>>3] |= (1u << (i & 7));
     }
 
-    // suf[i] = ∏_{j>=i} primes[j]
-    uint_custom suf[NUM_PRIMES + 1];
-    suf[NUM_PRIMES] = uint_custom_1;
+    // Build per-path suffixes in constant time:
+    // suf_real[i]  = ∏_{j>=i, es[j]!=0} primes[j]
+    // suf_dummy[i] = ∏_{j>=i, es[j]==0} primes[j]
+    uint_custom suf_real[NUM_PRIMES + 1], suf_dummy[NUM_PRIMES + 1];
+    suf_real[NUM_PRIMES]  = uint_custom_1;
+    suf_dummy[NUM_PRIMES] = uint_custom_1;
     for (size_t idx = NUM_PRIMES; idx-- > 0; ) {
-        suf[idx] = suf[idx+1];
-        uint_custom_mul3_64(&suf[idx], &suf[idx], primes[idx]);
+        suf_real[idx]  = suf_real[idx+1];
+        suf_dummy[idx] = suf_dummy[idx+1];
+
+        uint_custom t;
+        // update real suffix if es[idx]!=0
+        t = suf_real[idx];
+        uint_custom_mul3_64(&t, &t, primes[idx]);
+        uint8_t m_real = ct_mask_u8(es[idx] != 0);
+        ct_mem_cmov(&suf_real[idx], &t, sizeof(t), m_real);
+
+        // update dummy suffix if es[idx]==0
+        t = suf_dummy[idx];
+        uint_custom_mul3_64(&t, &t, primes[idx]);
+        uint8_t m_dummy = ct_mask_u8(es[idx] == 0);
+        ct_mem_cmov(&suf_dummy[idx], &t, sizeof(t), m_dummy);
     }
 
     // ------------------------------------------------------------------
@@ -273,6 +289,12 @@ void isogeny_constant(uint8_t number,
     //  - c1 = ∏_{es< 0} primes * p_cofactor
     //  - c2 = ∏_{es> 0} primes * p_cofactor
     // ------------------------------------------------------------------
+    // Compute public max bitlength for prep xMULs: C_total = p_cofactor * ∏ primes
+    uint_custom C_total = p_cofactor;
+    for (size_t j = 0; j < NUM_PRIMES; ++j) {
+        uint_custom_mul3_64(&C_total, &C_total, primes[j]);
+    }
+    size_t max_bits_prep = uint_custom_len(&C_total);
     proj A_sel = *A_out;
     proj t1, t2, add_sel;
 
@@ -283,22 +305,21 @@ void isogeny_constant(uint8_t number,
         else                uint_custom_mul3_64(&c0, &c0, primes[j]);
     }
 
-    xMUL(&t1, &A_sel, points[0], &c1);
-    xMUL(&t2, &A_sel, points[1], &c2);
+    xMUL_fixedbits(&t1, &A_sel, points[0], &c1, max_bits_prep);
+    xMUL_fixedbits(&t2, &A_sel, points[1], &c2, max_bits_prep);
     ADD(&add_sel, &t1, &t2, &A_sel);
-    xMUL(&add_sel, &A_sel, &add_sel, &c0);
+    xMUL_fixedbits(&add_sel, &A_sel, &add_sel, &c0, max_bits_prep);
 
     proj A_unsel = *A_out;
     proj add_unsel;
-    xMUL(&add_unsel, &A_unsel, points[1], &c1);
-    xMUL(&add_unsel, &A_unsel, &add_unsel, &c2);
+    xMUL_fixedbits(&add_unsel, &A_unsel, points[1], &c1, max_bits_prep);
+    xMUL_fixedbits(&add_unsel, &A_unsel, &add_unsel, &c2, max_bits_prep);
 
     proj R_sel, S_sel, R_unsel, S_unsel; 
     if (number == 3){
         R_sel = *points[2]; S_sel = *points[3];
         R_unsel = *points[2]; S_unsel = *points[3];
     } 
-
     proj K2;
 
     for (size_t i = 0; i < NUM_PRIMES; ++i) {
@@ -325,8 +346,9 @@ void isogeny_constant(uint8_t number,
         xMUL(&K2, &A, &K, &cof_sel);
 
         // Dummy-balanced xMUL on opposite path (discarded)
-        proj A_op = A_sel, K_op = add_sel;
+        proj A_op = A_sel, K_op = add_sel, K2_dummy;
         proj_cmov(&A_op, &A_unsel, m); proj_cmov(&K_op, &add_unsel, m);
+        xMUL(&K2_dummy, &A_op, &K_op, &cof_uns); (void)K2_dummy;
 
         proj *PP[4] = {&t1, &K, &R, &S};
 
@@ -342,7 +364,7 @@ void isogeny_constant(uint8_t number,
         if (number == 3){
             proj_cmov(&R_sel, &R, m); proj_cmov(&S_sel, &S, m);
             proj_cmov(&R_unsel,&R, m0);    proj_cmov(&S_unsel,&S, m0);
-        } 
+        }
 
     }
 

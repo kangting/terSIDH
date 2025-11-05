@@ -20,7 +20,7 @@ void xDBLv2(proj* Q, proj const* P, proj const* A24);
 void xADD(proj *S, proj const *P, proj const *Q, proj const *PQ);
 void xDBLADD(proj *R, proj *S, proj const *P, proj const *Q, proj const *PQ, proj const *A);
 void xMUL(proj *Q, proj const *A, proj const *P, uint_custom const *k);
-// Fixed-iterations Montgomery ladder (constant-time wrt bitlength)
+// Fixed-iteration Montgomery ladder; runs exactly max_bits rounds
 void xMUL_fixedbits(proj *Q, proj const *A, proj const *P, uint_custom const *k, size_t max_bits);
 
 void eval_4_isog(proj *P, fp2 *K1, fp2 *K2, fp2 *K3);

@@ -289,7 +289,7 @@ void xMUL(proj *Q, proj const *A, proj const *P, uint_custom const *k)
     }
 }
 
-// Fixed-iterations Montgomery ladder (constant-time wrt bitlength of k)
+// Fixed-iteration Montgomery ladder; runs exactly max_bits rounds
 void xMUL_fixedbits(proj *Q, proj const *A, proj const *P, uint_custom const *k, size_t max_bits)
 {
     proj R = *P;
@@ -300,13 +300,12 @@ void xMUL_fixedbits(proj *Q, proj const *A, proj const *P, uint_custom const *k,
 
     for (size_t i = max_bits; i-- > 0; ) {
         uint64_t bit = (uint64_t)uint_custom_bit(k, i);
-        uint64_t mask = (uint64_t)0 - bit;  // 0x..00 or 0x..FF..FF
+        uint64_t mask = (uint64_t)0 - bit;  // 0 or all-ones
         swap_points(Q, &R, mask);
         xDBLADD(Q, &R, Q, &R, &Pcopy, A);
         swap_points(Q, &R, mask);
     }
 }
-
 
 /* Montgomery <-> Edwards conversions */
 
