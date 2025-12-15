@@ -127,7 +127,8 @@ const struct uint_custom2 PQB = {{{
 }}};
 
 /* (p+1)/prod(primes) */
-const struct uint_custom p_cofactor = {{1}};
+const struct uint_custom p_cofactor = {{1}};          /* matches baked PA/PB/... */
+const struct uint_custom p_cofactor_runtime = {{363}}; /* for runtime generator */
 
 const struct fp fp_0 = {{0}};
 
@@ -244,4 +245,3 @@ const fp first_elligator_rand = {{
 
 
 const unsigned cost_ratio_inv_mul = 128; /* TODO figure out exactly */
-

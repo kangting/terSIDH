@@ -1,6 +1,7 @@
 
 #include <string.h>
 #include <assert.h>
+#include <stdlib.h>
 
 #include "uint_custom.h"
 #include "fpx.h"
@@ -23,6 +24,443 @@ const public_key base = {
     {{{{0}}, {{0}}},{{{0}}, {{0}}}}, {{{{0}}, {{0}}},{{{0}}, {{0}}}}
 };
 
+typedef struct {
+    uint64_t prime;
+    unsigned exp;
+} prime_power;
+
+typedef struct {
+    uint64_t m;             /* small modulus (prime power) */
+    uint64_t inv_n_mod_m;   /* (modulus/m)^(-1) mod m */
+    uint_custom n;          /* modulus/m */
+} crt_piece;
+
+#define MAX_PRIME_FACTORS (NUM_PRIMES * 2)
+
+static prime_power factors_A[MAX_PRIME_FACTORS];
+static prime_power factors_B[MAX_PRIME_FACTORS];
+static size_t factors_A_len = 0, factors_B_len = 0;
+static uint_custom order_A, order_B;
+static uint_custom cofactor_A, cofactor_B;
+static bool torsion_data_ready = false;
+static crt_piece crt_A[MAX_PRIME_FACTORS], crt_B[MAX_PRIME_FACTORS];
+
+static proj gen_PA, gen_QA, gen_PB, gen_QB, gen_PQA, gen_PQB;
+static bool generators_ready = false;
+static uint_custom active_cofactor;
+static bool last_generators_random = false;
+
+static bool sampling_debug_enabled(void) {
+    static int init = 0;
+    static bool enabled = false;
+    static bool announced = false;
+    if (!init) {
+        const char *v = getenv("TERSIDH_SAMPLE_DEBUG");
+        enabled = v && v[0];
+        init = 1;
+    }
+    if (enabled && !announced) {
+        fprintf(stderr, "[sample] debug logging enabled\n");
+        fflush(stderr);
+        announced = true;
+    }
+    return enabled;
+}
+
+/* forward */
+static void uint_custom_divmod_64_local(uint_custom *q, uint64_t *r, const uint_custom *x, uint64_t y);
+
+static bool divides_small(uint_custom const *x, uint64_t p) {
+    uint_custom q;
+    uint64_t rem = 0;
+    uint_custom_divmod_64_local(&q, &rem, x, p);
+    return rem == 0;
+}
+
+static bool coprime_to_factors(uint_custom const *x, const prime_power *factors, size_t len) {
+    for (size_t i = 0; i < len; ++i) {
+        if (divides_small(x, factors[i].prime))
+            return false;
+    }
+    return true;
+}
+
+static size_t collect_prime_powers(prime_power *out, const unsigned *primes) {
+    size_t count = 0;
+    for (size_t i = 0; i < NUM_PRIMES; ++i) {
+        unsigned n = primes[i];
+        for (unsigned p = 2; n > 1; ++p) {
+            if (n % p) continue;
+            unsigned exp = 0;
+            while (n % p == 0) {
+                n /= p;
+                ++exp;
+            }
+            size_t idx = 0;
+            for (; idx < count; ++idx) {
+                if (out[idx].prime == p) {
+                    out[idx].exp += exp;
+                    break;
+                }
+            }
+            if (idx == count) {
+                assert(count < MAX_PRIME_FACTORS);
+                out[count++] = (prime_power){p, exp};
+            }
+        }
+    }
+    return count;
+}
+
+static uint64_t prime_power_value(const prime_power *pp) {
+    uint64_t v = 1;
+    for (unsigned e = 0; e < pp->exp; ++e)
+        v *= pp->prime;
+    return v;
+}
+
+static int uint_custom_cmp(const uint_custom *x, const uint_custom *y) {
+    for (size_t i = LIMBS; i-- > 0; ) {
+        if (x->c[i] < y->c[i]) return -1;
+        if (x->c[i] > y->c[i]) return 1;
+    }
+    return 0;
+}
+
+static void uint_custom_add_mod(uint_custom *out, const uint_custom *a, const uint_custom *b, const uint_custom *mod) {
+    uint_custom sum;
+    uint_custom_add3(&sum, a, b);
+    if (uint_custom_cmp(&sum, mod) >= 0)
+        uint_custom_sub3(&sum, &sum, mod);
+    *out = sum;
+}
+
+static uint64_t inv_mod_u64(uint64_t a, uint64_t mod) {
+    int64_t t0 = 0, t1 = 1;
+    int64_t r0 = (int64_t)mod, r1 = (int64_t)(a % mod);
+    while (r1 != 0) {
+        int64_t q = r0 / r1;
+        int64_t tmp = r0 - q * r1; r0 = r1; r1 = tmp;
+        tmp = t0 - q * t1; t0 = t1; t1 = tmp;
+    }
+    if (r0 != 1) return 0;
+    if (t0 < 0) t0 += mod;
+    return (uint64_t)t0;
+}
+
+static void fill_crt_precomp(crt_piece *pcs, const prime_power *factors, size_t len,
+                             const uint_custom *modulus) {
+    for (size_t i = 0; i < len; ++i) {
+        uint64_t m = prime_power_value(&factors[i]);
+        pcs[i].m = m;
+
+        uint_custom q;
+        uint64_t rem = 0;
+        uint_custom_divmod_64_local(&q, &rem, modulus, m); /* q = modulus / m */
+        assert(rem == 0);
+        pcs[i].n = q;
+
+        uint64_t n_mod;
+        uint_custom tmp;
+        uint_custom_divmod_64_local(&tmp, &n_mod, &q, m);
+        pcs[i].inv_n_mod_m = inv_mod_u64(n_mod % m, m);
+        assert(pcs[i].inv_n_mod_m);
+    }
+}
+
+static bool uint_custom_inv_crt_fast64(uint_custom *inv, uint64_t k_small,
+                                       const uint_custom *modulus,
+                                       const crt_piece *pcs, size_t pcs_len) {
+    uint_custom acc = uint_custom_0;
+    for (size_t i = 0; i < pcs_len; ++i) {
+        uint64_t m = pcs[i].m;
+        uint64_t k_mod = k_small % m;
+        if (k_mod == 0)
+            return false;
+        uint64_t inv_k = inv_mod_u64(k_mod, m);
+        if (!inv_k)
+            return false;
+        uint64_t coeff = (uint64_t)(((__uint128_t)inv_k * pcs[i].inv_n_mod_m) % m);
+
+        uint_custom term;
+        uint_custom_mul3_64(&term, &pcs[i].n, coeff);
+        uint_custom_add_mod(&acc, &acc, &term, modulus);
+    }
+    *inv = acc;
+    return true;
+}
+
+static void compute_orders_and_cofactors(void) {
+    uint_custom_set(&order_A, 1);
+    uint_custom_set(&order_B, 1);
+
+    for (size_t i = 0; i < NUM_PRIMES; ++i) {
+        uint_custom_mul3_64(&order_A, &order_A, A_primes[i]);
+        uint_custom_mul3_64(&order_B, &order_B, B_primes[i]);
+    }
+
+    for (size_t i = 0; i < LIMBS; ++i) {
+        cofactor_A.c[i] = active_cofactor.c[i];
+        cofactor_B.c[i] = active_cofactor.c[i];
+    }
+    for (size_t i = 0; i < NUM_PRIMES; ++i) {
+        uint_custom_mul3_64(&cofactor_A, &cofactor_A, B_primes[i]);
+        uint_custom_mul3_64(&cofactor_B, &cofactor_B, A_primes[i]);
+    }
+
+    factors_A_len = collect_prime_powers(factors_A, A_primes);
+    factors_B_len = collect_prime_powers(factors_B, B_primes);
+    fill_crt_precomp(crt_A, factors_A, factors_A_len, &order_A);
+    fill_crt_precomp(crt_B, factors_B, factors_B_len, &order_B);
+
+    torsion_data_ready = true;
+}
+
+static bool random_point_on_curve(proj *P, const proj *A) {
+    fp2 x, rhs, tmp;
+    for (size_t i = 0; i < 256; ++i) {
+        fp2_random(&x);
+
+        fp2_sqr2(&rhs, &x);            /* x^2 */
+        fp2_mul3(&tmp, &A->x, &rhs);   /* A*x^2 */
+        fp2_mul2(&rhs, &x);            /* x^3 */
+        fp2_add2(&rhs, &tmp);          /* x^3 + A*x^2 */
+        fp2_add2(&rhs, &x);            /* x^3 + A*x^2 + x */
+
+        fp2 rhs_check = rhs;
+        if (!fp2_issquare(&rhs_check))
+            continue;
+
+        fp2_copy(&P->x, &x);
+        P->z = fp2_1;
+        return true;
+    }
+    return false;
+}
+
+static void uint_custom_divmod_64_local(uint_custom *q, uint64_t *r, const uint_custom *x, uint64_t y) {
+    uint64_t rem = 0;
+    for (size_t idx = 0; idx < LIMBS; ++idx) q->c[idx] = 0;
+
+    /* Bit-at-a-time long division to stay within portable 64-bit ops */
+    for (size_t limb = LIMBS; limb-- > 0; ) {
+        uint64_t word = x->c[limb];
+        for (unsigned bit = 0; bit < 64; ++bit) {
+            rem = (rem << 1) | (word >> 63);
+            word <<= 1;
+            if (rem >= y) {
+                rem -= y;
+                q->c[limb] |= (uint64_t)1 << (63 - bit);
+            }
+        }
+    }
+    *r = rem;
+}
+
+static bool divide_by_small(uint_custom *x, uint64_t p) {
+    uint_custom q;
+    uint64_t rem = 0;
+    uint_custom_divmod_64_local(&q, &rem, x, p);
+    if (rem) return false;
+    *x = q;
+    return true;
+}
+
+static bool has_exact_order(const proj *P, const proj *A, const uint_custom *order,
+                            const prime_power *factors, size_t factors_len) {
+    proj tmp;
+
+    /* ensure P*order == O */
+    xMUL(&tmp, A, P, order);
+    if (!is_infinity(&tmp))
+        return false;
+
+    /* check removing any prime factor (with multiplicity) kills the exactness */
+    for (size_t i = 0; i < factors_len; ++i) {
+        uint_custom k = *order;
+        for (unsigned e = 0; e < factors[i].exp; ++e) {
+            if (!divide_by_small(&k, factors[i].prime))
+                return false;
+            xMUL(&tmp, A, P, &k);
+            if (is_infinity(&tmp))
+                return false;
+        }
+    }
+    return true;
+}
+
+static bool sample_point_of_order(proj *out, const proj *A, const uint_custom *cofactor,
+                                  const uint_custom *order, const prime_power *factors,
+                                  size_t factors_len) {
+    const clock_t budget = (clock_t)(5 * CLOCKS_PER_SEC); /* ~5s per attempt */
+    const clock_t t0 = clock();
+
+    proj candidate;
+    size_t attempts = 0;
+    for (size_t i = 0; i < 1024; ++i) {
+        if (clock() - t0 > budget)
+            break;
+
+        bool debug = sampling_debug_enabled();
+        ++attempts;
+
+        if (!random_point_on_curve(&candidate, A))
+            continue;
+
+        xMUL(&candidate, A, &candidate, cofactor);
+        if (is_infinity(&candidate))
+            continue;
+
+        bool order_inf = false;
+        if (debug) {
+            proj order_check;
+            xMUL(&order_check, A, &candidate, order);
+            order_inf = is_infinity(&order_check);
+        }
+
+        bool order_ok = has_exact_order(&candidate, A, order, factors, factors_len);
+
+        if (debug) {
+            fprintf(stderr,
+                    "[sample] attempt %zu cofactor=%s order_inf=%d exact=%d x0=%016lx\n",
+                    i,
+                    (active_cofactor.c[0] == p_cofactor_runtime.c[0]) ? "runtime" : "baked",
+                    order_inf ? 1 : 0,
+                    order_ok ? 1 : 0,
+                    (unsigned long)candidate.x.a.c[0]);
+            fflush(stderr);
+        }
+
+        if (!order_ok)
+            continue;
+
+        *out = candidate;
+        return true;
+    }
+    if (sampling_debug_enabled()) {
+        fprintf(stderr, "[sample] no point found (attempts=%zu, timeout=%d)\n",
+                attempts, (clock() - t0) > budget);
+        fflush(stderr);
+    }
+    return false;
+}
+
+static bool sample_mask(uint_custom *mask, uint_custom *mask_inv, bool Alice) {
+    if (!torsion_data_ready)
+        compute_orders_and_cofactors();
+
+    const uint_custom *modulus = Alice ? &order_B : &order_A;
+    const prime_power *factors = Alice ? factors_B : factors_A;
+    size_t factors_len = Alice ? factors_B_len : factors_A_len;
+
+    for (int tries = 0; tries < 64; ++tries) {
+        uint64_t r;
+        randombytes(&r, sizeof(r));
+        r |= 1; /* avoid zero and even value that would conflict with 2^2 factor */
+
+        bool ok = true;
+        for (size_t i = 0; i < factors_len; ++i) {
+            if ((r % prime_power_value(&factors[i])) == 0) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok)
+            continue;
+
+        uint_custom inv;
+        if (!uint_custom_inv_crt_fast64(&inv, r, modulus,
+                                        Alice ? crt_B : crt_A, factors_len))
+            continue;
+
+        uint_custom_set(mask, r);
+        *mask_inv = inv;
+        return true;
+    }
+    return false;
+}
+
+static void compute_x_difference(proj *out, const proj *P, const proj *Q, const proj *A) {
+    proj P_aff = *P, Q_aff = *Q;
+    affinize(&P_aff, &Q_aff);
+
+    fp2 yP, yQ, x3, yQ_neg;
+    ec_recover_y(&yP, &P_aff.x, A);
+    ec_recover_y(&yQ, &Q_aff.x, A);
+    fp2_neg2(&yQ_neg, &yQ);
+    affine_add(&x3, &P_aff.x, &yP, &Q_aff.x, &yQ_neg, &A->x);
+
+    fp2_copy(&out->x, &x3);
+    out->z = fp2_1;
+}
+
+static bool ensure_generators(void) {
+    if (generators_ready)
+        return true;
+
+    if (!torsion_data_ready)
+        compute_orders_and_cofactors();
+
+    const clock_t budget_total = (clock_t)(20 * CLOCKS_PER_SEC); /* stop after ~20s overall */
+    const clock_t t_start = clock();
+
+    bool debug = sampling_debug_enabled();
+    if (debug) {
+        fprintf(stderr, "[sample] ensure_generators start (cofactor=%s)\n",
+                (active_cofactor.c[0] == p_cofactor_runtime.c[0]) ? "runtime" : "baked");
+        fflush(stderr);
+    }
+
+    proj A;
+    fp2_enc(&A.x, &base.A);
+    A.z = fp2_1;
+
+    if (!sample_point_of_order(&gen_PA, &A, &cofactor_A, &order_A, factors_A, factors_A_len))
+        return false;
+    if (clock() - t_start > budget_total) return false;
+    if (!sample_point_of_order(&gen_QA, &A, &cofactor_A, &order_A, factors_A, factors_A_len))
+        return false;
+    if (clock() - t_start > budget_total) return false;
+    if (!sample_point_of_order(&gen_PB, &A, &cofactor_B, &order_B, factors_B, factors_B_len))
+        return false;
+    if (clock() - t_start > budget_total) return false;
+    if (!sample_point_of_order(&gen_QB, &A, &cofactor_B, &order_B, factors_B, factors_B_len))
+        return false;
+    if (clock() - t_start > budget_total) return false;
+
+    compute_x_difference(&gen_PQA, &gen_PA, &gen_QA, &A);
+    compute_x_difference(&gen_PQB, &gen_PB, &gen_QB, &A);
+
+    generators_ready = true;
+    if (debug) {
+        fprintf(stderr, "[sample] ensure_generators success\n");
+        fflush(stderr);
+    }
+    return true;
+}
+
+__attribute__((visibility("default")))
+bool get_public_generators(proj *PA, proj *QA, proj *PB, proj *QB, proj *PQA, proj *PQB)
+{
+    if (!ensure_generators())
+        return false;
+
+    if (PA) copy_point(PA, &gen_PA);
+    if (QA) copy_point(QA, &gen_QA);
+    if (PB) copy_point(PB, &gen_PB);
+    if (QB) copy_point(QB, &gen_QB);
+    if (PQA) copy_point(PQA, &gen_PQA);
+    if (PQB) copy_point(PQB, &gen_PQB);
+
+    return true;
+}
+
+__attribute__((visibility("default")))
+bool generators_were_random(void)
+{
+    return last_generators_random;
+}
+
 __attribute__((visibility("default")))
 void setup(proj **points, bool Alice)
 {
@@ -30,18 +468,66 @@ void setup(proj **points, bool Alice)
     fp2_enc(&A.x, &base.A);
     A.z = fp2_1;
 
-    if (Alice) {
-        fp2_enc(&points[0]->x, &PA);
-        fp2_enc(&points[1]->x, &QA);
-        fp2_enc(&points[2]->x, &PB);
-        fp2_enc(&points[3]->x, &QB);
-    } else {
-        fp2_enc(&points[0]->x, &PB);
-        fp2_enc(&points[1]->x, &QB);
-        fp2_enc(&points[2]->x, &PA);
-        fp2_enc(&points[3]->x, &QA);
+    proj base_PA, base_QA, base_PB, base_QB;
+    bool use_random = true;
+
+    /* Start from baked generators and apply invertible scalars to each basis element. */
+    active_cofactor = p_cofactor;
+    torsion_data_ready = false;
+    generators_ready = false;
+    compute_orders_and_cofactors(); /* recompute with active_cofactor */
+
+    fp2_enc(&base_PA.x, &PA); base_PA.z = fp2_1;
+    fp2_enc(&base_QA.x, &QA); base_QA.z = fp2_1;
+    fp2_enc(&base_PB.x, &PB); base_PB.z = fp2_1;
+    fp2_enc(&base_QB.x, &QB); base_QB.z = fp2_1;
+
+    uint_custom sPA = uint_custom_1, sQA = uint_custom_1, sPB = uint_custom_1, sQB = uint_custom_1;
+
+    for (int tries = 0; tries < 32; ++tries) {
+        uint_custom k; uint_custom_random(&k, &order_A);
+        if (!uint_custom_eq(&k, &uint_custom_0) && coprime_to_factors(&k, factors_A, factors_A_len)) { sPA = k; break; }
     }
-    points[0]->z = points[1]->z = points[2]->z = points[3]->z = fp2_1;
+    for (int tries = 0; tries < 32; ++tries) {
+        uint_custom k; uint_custom_random(&k, &order_A);
+        if (!uint_custom_eq(&k, &uint_custom_0) && coprime_to_factors(&k, factors_A, factors_A_len)) { sQA = k; break; }
+    }
+    for (int tries = 0; tries < 32; ++tries) {
+        uint_custom k; uint_custom_random(&k, &order_B);
+        if (!uint_custom_eq(&k, &uint_custom_0) && coprime_to_factors(&k, factors_B, factors_B_len)) { sPB = k; break; }
+    }
+    for (int tries = 0; tries < 32; ++tries) {
+        uint_custom k; uint_custom_random(&k, &order_B);
+        if (!uint_custom_eq(&k, &uint_custom_0) && coprime_to_factors(&k, factors_B, factors_B_len)) { sQB = k; break; }
+    }
+
+    xMUL(&base_PA, &A, &base_PA, &sPA);
+    xMUL(&base_QA, &A, &base_QA, &sQA);
+    xMUL(&base_PB, &A, &base_PB, &sPB);
+    xMUL(&base_QB, &A, &base_QB, &sQB);
+    if (sampling_debug_enabled()) {
+        fprintf(stderr, "[sample] scalars PA=%016lx QA=%016lx PB=%016lx QB=%016lx\n",
+                (unsigned long)sPA.c[0], (unsigned long)sQA.c[0],
+                (unsigned long)sPB.c[0], (unsigned long)sQB.c[0]);
+        fflush(stderr);
+    }
+
+    last_generators_random = use_random;
+
+    if (Alice) {
+        copy_point(points[0], &base_PA);
+        copy_point(points[1], &base_QA);
+        copy_point(points[2], &base_PB);
+        copy_point(points[3], &base_QB);
+    } else {
+        copy_point(points[0], &base_PB);
+        copy_point(points[1], &base_QB);
+        copy_point(points[2], &base_PA);
+        copy_point(points[3], &base_QA);
+    }
+
+    /* one-line indicator for the caller/user */
+    (void)last_generators_random; /* always scaled now */
     return;
 }
 
@@ -115,7 +601,7 @@ void isogeny(uint8_t number, proj *A, proj **points, int8_t es[NUM_PRIMES], cons
             continue;
         }
 
-        uint_custom cofactor_zero = p_cofactor;
+        uint_custom cofactor_zero = active_cofactor;
         for (size_t i = 0; i < NUM_PRIMES; ++i)
             if (es[i] == 0)
                 uint_custom_mul3_64(&cofactor_zero, &cofactor_zero, primes[i]);
@@ -172,9 +658,9 @@ void isogeny_reduced(uint8_t number, proj *A, proj **points, int8_t es[NUM_PRIME
         }
     }
 
-    uint_custom cofactor0 = p_cofactor;
-    uint_custom cofactor1 = p_cofactor;
-    uint_custom cofactor2 = p_cofactor;
+    uint_custom cofactor0 = active_cofactor;
+    uint_custom cofactor1 = active_cofactor;
+    uint_custom cofactor2 = active_cofactor;
 
     for (size_t i = 0; i < NUM_PRIMES; ++i) {
         if (es[i] > 0) uint_custom_mul3_64(&cofactor2, &cofactor2, primes[i]);
@@ -252,6 +738,9 @@ void isogeny_constant(uint8_t number,
                       int8_t es[NUM_PRIMES],
                       const unsigned primes[NUM_PRIMES])
 {
+    typedef struct { double suf_ms, prep_ms, k2_ms_tot, k2_dummy_ms_tot, isog_ms_tot, cmov_ms_tot; } isog_prof;
+    isog_prof prof = (isog_prof){0};
+    clock_t prof_t0 = clock();
     unsigned char sel_real[(NUM_PRIMES + 7)/8] = {0};  // es[i]!=0
     unsigned char sel_dummy[(NUM_PRIMES + 7)/8] = {0}; // es[i]==0
     for (size_t i = 0; i < NUM_PRIMES; ++i) {
@@ -259,38 +748,27 @@ void isogeny_constant(uint8_t number,
         else            sel_dummy[i>>3] |= (1u << (i & 7));
     }
 
-    // Build per-path suffixes in constant time:
-    // suf_real[i]  = ∏_{j>=i, es[j]!=0} primes[j]
-    // suf_dummy[i] = ∏_{j>=i, es[j]==0} primes[j]
-    uint_custom suf_real[NUM_PRIMES + 1], suf_dummy[NUM_PRIMES + 1];
-    suf_real[NUM_PRIMES]  = uint_custom_1;
-    suf_dummy[NUM_PRIMES] = uint_custom_1;
-    for (size_t idx = NUM_PRIMES; idx-- > 0; ) {
-        suf_real[idx]  = suf_real[idx+1];
-        suf_dummy[idx] = suf_dummy[idx+1];
-
-        uint_custom t;
-        // update real suffix if es[idx]!=0
-        t = suf_real[idx];
-        uint_custom_mul3_64(&t, &t, primes[idx]);
-        uint8_t m_real = ct_mask_u8(es[idx] != 0);
-        ct_mem_cmov(&suf_real[idx], &t, sizeof(t), m_real);
-
-        // update dummy suffix if es[idx]==0
-        t = suf_dummy[idx];
-        uint_custom_mul3_64(&t, &t, primes[idx]);
-        uint8_t m_dummy = ct_mask_u8(es[idx] == 0);
-        ct_mem_cmov(&suf_dummy[idx], &t, sizeof(t), m_dummy);
+    // Randomize processing order of primes (Fisher-Yates shuffle)
+    size_t order[NUM_PRIMES];
+    for (size_t i = 0; i < NUM_PRIMES; ++i) order[i] = i;
+    for (size_t k = NUM_PRIMES; k > 1; --k) {
+        uint32_t r;
+        randombytes(&r, sizeof(r));
+        size_t j = (size_t)(r % k);
+        size_t tmp = order[k-1]; order[k-1] = order[j]; order[j] = tmp;
     }
+    // Track which primes have been used already (to exclude from future cofactors)
+    uint8_t used[NUM_PRIMES] = {0};
+    prof.suf_ms = 1000.0 * (clock() - prof_t0) / CLOCKS_PER_SEC;
 
     // ------------------------------------------------------------------
     // add_sel/add_unsel
-    //  - c0 = ∏_{es==0} primes * p_cofactor
-    //  - c1 = ∏_{es< 0} primes * p_cofactor
-    //  - c2 = ∏_{es> 0} primes * p_cofactor
+    //  - c0 = ∏_{es==0} primes * cofactor
+    //  - c1 = ∏_{es< 0} primes * cofactor
+    //  - c2 = ∏_{es> 0} primes * cofactor
     // ------------------------------------------------------------------
-    // Compute public max bitlength for prep xMULs: C_total = p_cofactor * ∏ primes
-    uint_custom C_total = p_cofactor;
+    // Compute public max bitlength for prep xMULs: C_total = cofactor * ∏ primes
+    uint_custom C_total = active_cofactor;
     for (size_t j = 0; j < NUM_PRIMES; ++j) {
         uint_custom_mul3_64(&C_total, &C_total, primes[j]);
     }
@@ -298,7 +776,7 @@ void isogeny_constant(uint8_t number,
     proj A_sel = *A_out;
     proj t1, t2, add_sel;
 
-    uint_custom c0 = p_cofactor, c1 = p_cofactor, c2 = p_cofactor;
+    uint_custom c0 = active_cofactor, c1 = active_cofactor, c2 = active_cofactor;
     for (size_t j = 0; j < NUM_PRIMES; ++j) {
         if      (es[j] < 0) uint_custom_mul3_64(&c1, &c1, primes[j]);
         else if (es[j] > 0) uint_custom_mul3_64(&c2, &c2, primes[j]);
@@ -314,6 +792,7 @@ void isogeny_constant(uint8_t number,
     proj add_unsel;
     xMUL_fixedbits(&add_unsel, &A_unsel, points[1], &c1, max_bits_prep);
     xMUL_fixedbits(&add_unsel, &A_unsel, &add_unsel, &c2, max_bits_prep);
+    prof.prep_ms = 1000.0 * (clock() - prof_t0) / CLOCKS_PER_SEC;
 
     proj R_sel, S_sel, R_unsel, S_unsel; 
     if (number == 3){
@@ -322,7 +801,8 @@ void isogeny_constant(uint8_t number,
     } 
     proj K2;
 
-    for (size_t i = 0; i < NUM_PRIMES; ++i) {
+    for (size_t it = 0; it < NUM_PRIMES; ++it) {
+        size_t i = order[it];
 
         int M = (sel_real[i>>3] >> (i & 7)) & 1;
         uint8_t m  = ct_mask_u8(M);        // 0xFF if real, else 0x00
@@ -336,28 +816,41 @@ void isogeny_constant(uint8_t number,
         proj_cmov(&K, &add_sel, m); proj_cmov(&A, &A_sel, m);
         if (number == 3) { proj_cmov(&R, &R_sel, m); proj_cmov(&S, &S_sel, m); }
 
-        // Real and dummy cofactors
-        uint_custom cof_real = suf_real[i+1];
-        uint_custom cof_dummy = suf_dummy[i+1];
-        uint_custom cof_sel = cof_dummy; ct_mem_cmov(&cof_sel, &cof_real, sizeof(cof_sel), m);
-        uint_custom cof_uns = cof_real;  ct_mem_cmov(&cof_uns, &cof_dummy, sizeof(cof_uns), m);
+        // Build cofactors on-the-fly by multiplying remaining primes in each subgroup
+        uint_custom cof_sel = uint_custom_1;
+        uint_custom cof_uns = uint_custom_1;
+        for (size_t j = 0; j < NUM_PRIMES; ++j) {
+            if (j == i || used[j]) continue; // skip current and already used
+            if ((es[j] != 0) == (M != 0)) {
+                uint_custom_mul3_64(&cof_sel, &cof_sel, primes[j]);
+            } else {
+                uint_custom_mul3_64(&cof_uns, &cof_uns, primes[j]);
+            }
+        }
 
         // Real K2
+        clock_t t_k2 = clock();
         xMUL(&K2, &A, &K, &cof_sel);
+        prof.k2_ms_tot += 1000.0 * (clock() - t_k2) / CLOCKS_PER_SEC;
 
         // Dummy-balanced xMUL on opposite path (discarded)
+        clock_t t_k2d = clock();
         proj A_op = A_sel, K_op = add_sel, K2_dummy;
         proj_cmov(&A_op, &A_unsel, m); proj_cmov(&K_op, &add_unsel, m);
         xMUL(&K2_dummy, &A_op, &K_op, &cof_uns); (void)K2_dummy;
+        prof.k2_dummy_ms_tot += 1000.0 * (clock() - t_k2d) / CLOCKS_PER_SEC;
 
         proj *PP[4] = {&t1, &K, &R, &S};
 
+        clock_t t_isog = clock();
         if (primes[i] == 4) xISOG_4(&A, PP, &K2, number);
         else {
             if      (number == 3) xISOG_3pts(&A, PP, &K2, primes[i]);
             else                  xISOG_1pt (&A, PP, &K2, primes[i]);
         }
+        prof.isog_ms_tot += 1000.0 * (clock() - t_isog) / CLOCKS_PER_SEC;
 
+        clock_t t_cmov = clock();
         proj_cmov(&A_sel, &A, m); proj_cmov(&add_sel, &K, m);
         proj_cmov(&A_unsel, &A, m0); proj_cmov(&add_unsel, &K, m0);
 
@@ -365,7 +858,9 @@ void isogeny_constant(uint8_t number,
             proj_cmov(&R_sel, &R, m); proj_cmov(&S_sel, &S, m);
             proj_cmov(&R_unsel,&R, m0);    proj_cmov(&S_unsel,&S, m0);
         }
+        prof.cmov_ms_tot += 1000.0 * (clock() - t_cmov) / CLOCKS_PER_SEC;
 
+        used[i] = 1; // mark this prime as processed
     }
 
     *A_out = A_sel;
@@ -375,7 +870,6 @@ void isogeny_constant(uint8_t number,
 }
 
 /* includes public-key validation. */
-/* totally not constant-time. */
 __attribute__((visibility("default")))
 bool keygen(public_key *out, proj **points, public_key const *in, private_key *priv, bool Alice)
 {   
@@ -392,6 +886,13 @@ bool keygen(public_key *out, proj **points, public_key const *in, private_key *p
     // isogeny(4, &A, points, es, primes);
     // isogeny_reduced(3, &A, points, es, primes);
     isogeny_constant(3, &A, points, es, primes);
+
+    uint_custom mask, mask_inv;
+    if (!sample_mask(&mask, &mask_inv, Alice))
+        return false;
+
+    xMUL(points[2], &A, points[2], &mask);
+    xMUL(points[3], &A, points[3], &mask_inv);
 
     affinize(&A, NULL);
     assert(is_affine(&A));

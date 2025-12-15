@@ -16,7 +16,7 @@ typedef struct public_key {
 
 extern const public_key base;
 
-void random_generators_in_subgroup(proj *P, proj *Q, const proj *A, bool want_A_side);
+bool get_public_generators(proj *PA, proj *QA, proj *PB, proj *QB, proj *PQA, proj *PQB);
 
 void setup(proj **points, bool Alice);
 void tersidh_private(private_key *priv);
@@ -27,5 +27,6 @@ void isogeny_reduced(uint8_t number, proj *A, proj **points, int8_t es[NUM_PRIME
 void isogeny_constant(uint8_t number, proj *A, proj **points, int8_t es[NUM_PRIMES], const unsigned primes[NUM_PRIMES]);
 bool keygen(public_key *out, proj **points, public_key const *in, private_key *priv, bool Alice);
 bool shared(fp2 *out, public_key *in, private_key const *priv, bool Alice);
+bool generators_were_random(void);
 
 #endif

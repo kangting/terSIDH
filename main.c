@@ -11,7 +11,7 @@
 #include "uint_custom.h"
 #include "mont.h"
 
-#define N 100
+#define N 1
 
 typedef struct {
     const char *label;
@@ -92,11 +92,11 @@ int main(void)
     
     private_key priv_alice, priv_bob;
     public_key pub_alice, pub_bob;
-    proj xPA, xQA, xPB, xQB;
-    proj xPA2, xQA2, xPB2, xQB2;
+    proj base_alice_points[4], base_bob_points[4];
+    proj work_alice_points[4], work_bob_points[4];
     fp2 shared_alice, shared_bob;
-    proj *points_alice[4] = {&xPA, &xQA, &xPB, &xQB};
-    proj *points_bob[4] = {&xPB2, &xQB2, &xPA2, &xQA2};
+    proj *points_alice[4] = {&work_alice_points[0], &work_alice_points[1], &work_alice_points[2], &work_alice_points[3]};
+    proj *points_bob[4] = {&work_bob_points[0], &work_bob_points[1], &work_bob_points[2], &work_bob_points[3]};
 
     double alice_keygen_sum = 0;
     double bob_keygen_sum = 0;
@@ -115,11 +115,18 @@ int main(void)
     };
     int S = (int)(sizeof(cases)/sizeof(cases[0]));
 
+    /* Prepare base generator sets once, then copy per iteration to avoid expensive setup */
+    proj *setup_targets_alice[4] = {&base_alice_points[0], &base_alice_points[1], &base_alice_points[2], &base_alice_points[3]};
+    proj *setup_targets_bob[4]   = {&base_bob_points[0],   &base_bob_points[1],   &base_bob_points[2],   &base_bob_points[3]};
+    setup(setup_targets_alice, true);
+    setup(setup_targets_bob, false);
+
     print_table_header();
     for (int s = 0; s < S; ++s){
         double sum_ms = 0.0;
         for (int iter = 0; iter < N; ++iter) {
-            setup(points_alice, true);
+            /* refresh working copies */
+            for (int i = 0; i < 4; ++i) copy_point(points_alice[i], &base_alice_points[i]);
             cases[s].fill(&priv_alice);
             t0 = clock();
             ret = keygen(&pub_alice, points_alice, &base, &priv_alice, true);
@@ -137,8 +144,10 @@ int main(void)
 
     for (int iter = 0; iter < N; iter++) {
 
-        setup(points_alice, true);
-        setup(points_bob, false);
+        for (int i = 0; i < 4; ++i) {
+            copy_point(points_alice[i], &base_alice_points[i]);
+            copy_point(points_bob[i],   &base_bob_points[i]);
+        }
 
         tersidh_private(&priv_alice);
         tersidh_private(&priv_bob);
@@ -179,5 +188,8 @@ int main(void)
     printf("Average alice shared time: %7.3lf ms\n", alice_shared_sum / N);
     printf("Average bob shared time:   %7.3lf ms\n", bob_shared_sum / N);
     printf("\n");
+
+    // print_fp2(shared_alice);
+    // print_fp2(shared_bob);
     
 }

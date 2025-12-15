@@ -10,6 +10,7 @@ extern const uint_custom2 QB;
 extern const uint_custom2 PQA;
 extern const uint_custom2 PQB;
 extern const uint_custom p_cofactor;
+extern const uint_custom p_cofactor_runtime;
 extern const fp fp_0;
 extern const fp fp_1;
 extern const fp fp_2;

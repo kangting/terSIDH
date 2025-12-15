@@ -238,6 +238,7 @@ void print_fp2(fp2 x) {
     print_fp(x.b);
 }
 
+__attribute__((visibility("default")))
 void copy_point(proj* P, proj const* Q)
 {
     fp2_copy(&(P->x), &(Q->x));
