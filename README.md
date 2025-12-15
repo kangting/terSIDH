@@ -1,4 +1,4 @@
-# terSIDH: Constant terSIDH (p128 by default)
+# Constant terSIDH (p128 by default)
 
 ## Build
 
