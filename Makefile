@@ -1,4 +1,4 @@
-.PHONY: main bench clean
+.PHONY: main clean
 
 BITS?=128
 
@@ -70,20 +70,6 @@ debug: ${includes} ${sources} main.c
 		-o debug
 
 
-bench: ${includes} ${sources} bench.c
-	@cc \
-		$(if ${BENCH_ITS},-DBENCH_ITS=${BENCH_ITS}) \
-		$(if ${BENCH_VERBOSE},-DBENCH_VERBOSE=${BENCH_VERBOSE}) \
-		-I ./ \
-		-I p${BITS}/ \
-		-std=c99 -pedantic \
-		-Wall -Wextra \
-		-march=native -O3 \
-		$(sources) \
-		bench.c \
-		-o bench
-
-
 test: ${includes} $(sources) test.c
 	@cc \
     	-I ./p128 \
@@ -97,7 +83,7 @@ test: ${includes} $(sources) test.c
 
 
 clean:
-	@rm -f main debug bench libtersidh.so test_program *.o p*/*.o
+	@rm -f main debug libtersidh.so test_program *.o p*/*.o
 
 %.o: %.s
 	$(CC) -c -fPIC $< -o $@

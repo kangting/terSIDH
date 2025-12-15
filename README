@@ -1,79 +1,80 @@
+# terSIDH: Constant‑time Montgomery Isogeny Toolkit (p128 by default)
 
-To build with default parameters, simply run "make".
+## Build
 
-The build may be configured with other arguments:
+To build with default parameters, simply run:
 
-- BITS is one of the supported parameter sets.
-- UINT_IMPL is an unsigned integer implementation.
-- FP_IMPL is a finite field implementation.
+    make
 
-For example,
+Configurable build arguments:
+
+- BITS Selects a supported parameter set directory (default: 128 → `p128/`).
+- UINT_IMPL Unsigned‑integer backend implementation.
+- FP_IMPL Finite‑field backend implementation.
+
+Examples:
 
     make BITS=1024
 
-builds the code with a 1024-bit parameter set, and
+builds using the `p1024/` parameter set (if present), and:
 
     make UINT_IMPL=uint.c FP_IMPL=fp.c
 
-uses generic C arithmetic instead of assembly.
+uses the generic C arithmetic instead of assembly.
 
+## Adding parameter sets
 
-Other parameter sets may be used by creating a directory modelled
-after the p512/ and p1024/ folders, optionally including specialized
-uint.s and fp.s files for assembly arithmetic. Otherwise the generic
-C implementation will be used.
+Create a directory `p${BITS}/` modelled after `p128/`, optionally with
+specialized `uint*.s` and `fp*.s` for assembly arithmetic. Otherwise the
+generic C implementations will be used.
 
+## Targets
 
-To build the benchmark code, run "make bench"; it also supports the
-arguments listed above.
+- `make` Builds the shared library (`libtersidh.so`) and the demo `main`.
+- `make test` Builds a simple test program.
+- `make clean` Removes build artifacts.
 
-To configure benchmarking, use the following options:
+prints aggregate timing and operation counts for 1000 iterations.
 
-- BENCH_ITS is the number of iterations.
-- BENCH_VERBOSE enables counts of higher-level operations.
+## About this implementation
 
-For example,
+This codebase implements a constant‑time variant of the Montgomery isogeny
+toolchain for terSIDH‑style flows. Key elements:
 
-    make bench BENCH_ITS=1000 BENCH_VERBOSE=1
+- Per‑path cofactor selection for kernel reduction (real/dummy suffixes) to ensure
+  the kernel point has exact order `primes[i]` at every step (including degree‑4).
+- Fixed‑iteration Montgomery ladder is used in the key‑independent “prep” phase to
+  mitigate timing variance from differing scalar bitlengths.
+- Constant‑time conditional moves (cmov) are used for path selection and state updates.
 
-builds a benchmark tool for 1000 iterations of the CSIDH group action
-(including public-key validation), which collects statistics on the
-number of clock cycles as well as precise counts for the underlying
-arithmetic operations.
+The provided `main` demonstrates key generation and prints a compact table across
+several private‑key distributions. The demo can be adapted for integration or further
+measurement as needed.
 
-
+## References
 
 This implementation makes use of ideas from these references:
 
-* W. Castryck, T. Lange, C. Martindale, L. Panny, J. Renes:
-  CSIDH: An efficient post-quantum commutative group action.
+- W. Castryck, T. Lange, C. Martindale, L. Panny, J. Renes:
+  CSIDH: An efficient post‑quantum commutative group action.
   Asiacrypt 2018, https://ia.cr/2018/383
 
-* M. Meyer, S. Reith:
+- M. Meyer, S. Reith:
   A faster way to the CSIDH.
   Indocrypt 2018, https://ia.cr/2018/782
 
-* D. J. Bernstein, T. Lange, C. Martindale, L. Panny:
-  Quantum circuits for the CSIDH: \
-    Optimizing quantum evaluation of isogenies.
+- D. J. Bernstein, T. Lange, C. Martindale, L. Panny:
+  Quantum circuits for the CSIDH: Optimizing quantum evaluation of isogenies.
   Eurocrypt 2019, https://ia.cr/2018/1059
 
-* M. Meyer, F. Campos, S. Reith:
-  On Lions and Elligators: \
-    An efficient constant-time implementation of CSIDH.
+- M. Meyer, F. Campos, S. Reith:
+  On Lions and Elligators: An efficient constant‑time implementation of CSIDH.
   PQCrypto 2019, https://ia.cr/2018/1198
 
-Furthermore, thanks to Daniel J. Bernstein and Bo-Yin Yang for
-providing the fast 511-bit finite-field inversion code in the
-directory p512/inv, which is based on the following paper:
-
-* D. J. Bernstein, B.-Y. Yang:
-  Fast constant-time gcd computation and modular inversion.
+- D. J. Bernstein, B.-Y. Yang:
+  Fast constant‑time gcd computation and modular inversion.
   CHES 2019, https://ia.cr/2019/266
 
-
-
-This updated version of the CSIDH-512 software was originally produced
-based on the previous version 2018-08-26 between 2018-09 and 2019-05.
-It appears in public only as late as 2021 due to human error.
-
+- S. Kim:
+  Performance and Efficiency Evaluation of M‑SIDH.
+  IEEE Access, 2024. https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=10786215
