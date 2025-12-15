@@ -50,23 +50,6 @@ static bool generators_ready = false;
 static uint_custom active_cofactor;
 static bool last_generators_random = false;
 
-static bool sampling_debug_enabled(void) {
-    static int init = 0;
-    static bool enabled = false;
-    static bool announced = false;
-    if (!init) {
-        const char *v = getenv("TERSIDH_SAMPLE_DEBUG");
-        enabled = v && v[0];
-        init = 1;
-    }
-    if (enabled && !announced) {
-        fprintf(stderr, "[sample] debug logging enabled\n");
-        fflush(stderr);
-        announced = true;
-    }
-    return enabled;
-}
-
 /* forward */
 static void uint_custom_divmod_64_local(uint_custom *q, uint64_t *r, const uint_custom *x, uint64_t y);
 
@@ -301,7 +284,6 @@ static bool sample_point_of_order(proj *out, const proj *A, const uint_custom *c
         if (clock() - t0 > budget)
             break;
 
-        bool debug = sampling_debug_enabled();
         ++attempts;
 
         if (!random_point_on_curve(&candidate, A))
@@ -311,36 +293,13 @@ static bool sample_point_of_order(proj *out, const proj *A, const uint_custom *c
         if (is_infinity(&candidate))
             continue;
 
-        bool order_inf = false;
-        if (debug) {
-            proj order_check;
-            xMUL(&order_check, A, &candidate, order);
-            order_inf = is_infinity(&order_check);
-        }
-
         bool order_ok = has_exact_order(&candidate, A, order, factors, factors_len);
-
-        if (debug) {
-            fprintf(stderr,
-                    "[sample] attempt %zu cofactor=%s order_inf=%d exact=%d x0=%016lx\n",
-                    i,
-                    (active_cofactor.c[0] == p_cofactor_runtime.c[0]) ? "runtime" : "baked",
-                    order_inf ? 1 : 0,
-                    order_ok ? 1 : 0,
-                    (unsigned long)candidate.x.a.c[0]);
-            fflush(stderr);
-        }
 
         if (!order_ok)
             continue;
 
         *out = candidate;
         return true;
-    }
-    if (sampling_debug_enabled()) {
-        fprintf(stderr, "[sample] no point found (attempts=%zu, timeout=%d)\n",
-                attempts, (clock() - t0) > budget);
-        fflush(stderr);
     }
     return false;
 }
@@ -404,13 +363,6 @@ static bool ensure_generators(void) {
     const clock_t budget_total = (clock_t)(20 * CLOCKS_PER_SEC); /* stop after ~20s overall */
     const clock_t t_start = clock();
 
-    bool debug = sampling_debug_enabled();
-    if (debug) {
-        fprintf(stderr, "[sample] ensure_generators start (cofactor=%s)\n",
-                (active_cofactor.c[0] == p_cofactor_runtime.c[0]) ? "runtime" : "baked");
-        fflush(stderr);
-    }
-
     proj A;
     fp2_enc(&A.x, &base.A);
     A.z = fp2_1;
@@ -432,10 +384,6 @@ static bool ensure_generators(void) {
     compute_x_difference(&gen_PQB, &gen_PB, &gen_QB, &A);
 
     generators_ready = true;
-    if (debug) {
-        fprintf(stderr, "[sample] ensure_generators success\n");
-        fflush(stderr);
-    }
     return true;
 }
 
@@ -505,12 +453,6 @@ void setup(proj **points, bool Alice)
     xMUL(&base_QA, &A, &base_QA, &sQA);
     xMUL(&base_PB, &A, &base_PB, &sPB);
     xMUL(&base_QB, &A, &base_QB, &sQB);
-    if (sampling_debug_enabled()) {
-        fprintf(stderr, "[sample] scalars PA=%016lx QA=%016lx PB=%016lx QB=%016lx\n",
-                (unsigned long)sPA.c[0], (unsigned long)sQA.c[0],
-                (unsigned long)sPB.c[0], (unsigned long)sQB.c[0]);
-        fflush(stderr);
-    }
 
     last_generators_random = use_random;
 
@@ -738,14 +680,9 @@ void isogeny_constant(uint8_t number,
                       int8_t es[NUM_PRIMES],
                       const unsigned primes[NUM_PRIMES])
 {
-    typedef struct { double suf_ms, prep_ms, k2_ms_tot, k2_dummy_ms_tot, isog_ms_tot, cmov_ms_tot; } isog_prof;
-    isog_prof prof = (isog_prof){0};
-    clock_t prof_t0 = clock();
     unsigned char sel_real[(NUM_PRIMES + 7)/8] = {0};  // es[i]!=0
-    unsigned char sel_dummy[(NUM_PRIMES + 7)/8] = {0}; // es[i]==0
     for (size_t i = 0; i < NUM_PRIMES; ++i) {
         if (es[i] != 0) sel_real[i>>3] |= (1u << (i & 7));
-        else            sel_dummy[i>>3] |= (1u << (i & 7));
     }
 
     // Randomize processing order of primes (Fisher-Yates shuffle)
@@ -759,7 +696,6 @@ void isogeny_constant(uint8_t number,
     }
     // Track which primes have been used already (to exclude from future cofactors)
     uint8_t used[NUM_PRIMES] = {0};
-    prof.suf_ms = 1000.0 * (clock() - prof_t0) / CLOCKS_PER_SEC;
 
     // ------------------------------------------------------------------
     // add_sel/add_unsel
@@ -792,7 +728,6 @@ void isogeny_constant(uint8_t number,
     proj add_unsel;
     xMUL_fixedbits(&add_unsel, &A_unsel, points[1], &c1, max_bits_prep);
     xMUL_fixedbits(&add_unsel, &A_unsel, &add_unsel, &c2, max_bits_prep);
-    prof.prep_ms = 1000.0 * (clock() - prof_t0) / CLOCKS_PER_SEC;
 
     proj R_sel, S_sel, R_unsel, S_unsel; 
     if (number == 3){
@@ -829,28 +764,20 @@ void isogeny_constant(uint8_t number,
         }
 
         // Real K2
-        clock_t t_k2 = clock();
         xMUL(&K2, &A, &K, &cof_sel);
-        prof.k2_ms_tot += 1000.0 * (clock() - t_k2) / CLOCKS_PER_SEC;
 
         // Dummy-balanced xMUL on opposite path (discarded)
-        clock_t t_k2d = clock();
         proj A_op = A_sel, K_op = add_sel, K2_dummy;
         proj_cmov(&A_op, &A_unsel, m); proj_cmov(&K_op, &add_unsel, m);
         xMUL(&K2_dummy, &A_op, &K_op, &cof_uns); (void)K2_dummy;
-        prof.k2_dummy_ms_tot += 1000.0 * (clock() - t_k2d) / CLOCKS_PER_SEC;
 
         proj *PP[4] = {&t1, &K, &R, &S};
 
-        clock_t t_isog = clock();
         if (primes[i] == 4) xISOG_4(&A, PP, &K2, number);
         else {
             if      (number == 3) xISOG_3pts(&A, PP, &K2, primes[i]);
             else                  xISOG_1pt (&A, PP, &K2, primes[i]);
         }
-        prof.isog_ms_tot += 1000.0 * (clock() - t_isog) / CLOCKS_PER_SEC;
-
-        clock_t t_cmov = clock();
         proj_cmov(&A_sel, &A, m); proj_cmov(&add_sel, &K, m);
         proj_cmov(&A_unsel, &A, m0); proj_cmov(&add_unsel, &K, m0);
 
@@ -858,7 +785,6 @@ void isogeny_constant(uint8_t number,
             proj_cmov(&R_sel, &R, m); proj_cmov(&S_sel, &S, m);
             proj_cmov(&R_unsel,&R, m0);    proj_cmov(&S_unsel,&S, m0);
         }
-        prof.cmov_ms_tot += 1000.0 * (clock() - t_cmov) / CLOCKS_PER_SEC;
 
         used[i] = 1; // mark this prime as processed
     }
